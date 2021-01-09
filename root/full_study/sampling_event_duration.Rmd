@@ -1,0 +1,971 @@
+---
+title: "Sampling Event Duration"
+author: "Alberto Dell'Era"
+link-citations: yes
+output:
+  pdf_document: 
+    keep_tex: true
+  html_document: default
+  github_document: 
+    pandoc_args: --webtex
+bibliography: sampling_event_duration.bib
+---
+ <!-- math formulae support.
+        html_document: by default knit uses pandoc's --self-contained, hence math formulae will be converted
+                       to images embedded as base64bits ( <embed src="data:image/png;base64,iV...."</embed>),
+                       hence perfect.
+                       https://pandoc.org/MANUAL.html#option--self-contained
+        pdf_document: perfect, obviously; they are "printed" in ps.
+        github_document: oops. --self-contained does not work, and by default the latex fragments are left as is,
+                and hence they are not rendered on github. 
+                --mathjax does not work since it renders math by using a JS library and github, 
+                for security, does not run JS.
+                The next best option is --webtex, that calls a web server on-the-flight 
+                   "https://latex.codecogs.com/png.latex?%5Coverrightarrow%7Bp%7D%28t%29" 
+                that renders the formula and gives back an image, that is then displayed by the browser.
+                It is quick, but there's the external dependency on the codecogs web server ... good for
+                small summary documents I would say, not future-proof.
+                Note: on github all images are proxied by Camo (https://github.com/atmos/camo), hence in the web browser 
+                we will see 
+                <img src="https://camo.githubusercontent.com/... data-canonical-src="https://latex.codecogs.com/png.latex?..."">
+                Of course there will be the option to call codecogs by hand and substitute the images manually,
+                serving them from the doc directory... there seem to be some scripts around that do that automatically.
+                Another option: TeXify https://stackoverflow.com/a/53981118
+      Final Note: mathML is supported by Firefox and Safari only; Chrome withdrew its support. Hence it is dead.
+      -->               
+
+<!-- https://stackoverflow.com/questions/39814916/how-can-i-see-output-of-rmd-in-github -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+knitr::opts_chunk$set(message = FALSE) # print to console, not inside document
+knitr::opts_chunk$set(warning = FALSE) # print to console, not inside document
+knitr::opts_chunk$set(error   = FALSE) # print to console and stop on errors
+# note: "dpi" includes "fig.retina", if all is defaulted dpi=def_retina*def_dpi=2*96=192
+#       but out.width is 96 * fig.width
+knitr::opts_chunk$set(fig.width = 10)
+knitr::opts_chunk$set(fig.asp = 0.618)
+knitr::opts_chunk$set(fig.align = "center") 
+knitr::opts_chunk$set(out.width = 960) 
+
+# special settings for pdf (created via Latex, hence knitr::is_latex_output() => TRUE)
+# knitr::is_latex_output() is FALSE for both html_document and (surprisingly?) github_document
+if (knitr::is_latex_output()) {
+  # set out.width the following way, otherwise images get truncated to the right 
+  # check https://yihui.org/knitr/demo/framed/, at the bottom
+  knitr::opts_chunk$set(out.width ='1.0\\textwidth') 
+}
+
+options(mc.cores = parallel::detectCores()-1)
+
+library(rstan)
+library(coda)
+library(knitr)
+library(HDInterval)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(tidyverse) 
+library(latex2exp)
+```
+
+```{r, cross_join, include=FALSE}
+cross_join <- function(df1, df2) {
+  # https://jarrettmeyer.com/2018/07/10/cross-join-dplyr
+  df1_fake <- df1 %>% mutate(..f.a.k.e = 0)
+  df2_fake <- df2 %>% mutate(..f.a.k.e = 0)
+  full_join(df1_fake, df2_fake, by = "..f.a.k.e") %>% select(- ..f.a.k.e)
+}
+#cross_join(tibble(x=0:1), tibble(y=10:11))
+```
+
+```{r, utils_krushke, include=FALSE}
+# from Krushke, 2015, "Doing Bayesian Data Analysis", 2nd Edition, page 238
+gammaShRaFromMeanSD = function( mean , sd ) {
+  if ( mean <=0 ) stop("mean must be > 0")
+  if ( sd <=0 ) stop("sd must be > 0")
+  shape = mean^2/sd^2
+  rate = mean/sd^2
+  return( list( shape=shape , rate=rate ) )
+}
+
+gammaShRaFromModeSD = function( mode , sd ) {
+  if ( mode <=0 ) stop("mode must be > 0")
+  if ( sd <=0 ) stop("sd must be > 0")
+  rate = ( mode + sqrt( mode^2 + 4 * sd^2 ) ) / ( 2 * sd^2 )
+  shape = 1 + mode * rate
+  return( list( shape=shape , rate=rate ) )
+}
+```
+
+```{r globals, include=FALSE}
+g <- 9.81 # m/s^2
+
+p0x.true          <-    0 # m
+v0.true           <-  666 # m/s 666
+theta.true        <- pi/4 # rad
+readings.error.sd <- 250  # m  
+readings.n        <- 3 
+
+```
+*A short summary is available at: <https://github.com/alberto-dellera/sampling_event_duration/blob/master/README.md>*
+
+*Github readers: github on-line resolution is very low, and the pdf can be even truncated(!)  
+I'd suggest to download this pdf and open it locally*
+  
+# Abstract
+
+We will study an event sampling process whose sampling period is uniform:
+```{r abstract_sampling_illustration, echo=FALSE, fig.asp = 0.15}
+dur <- tribble(
+  ~sta, ~sto,
+  0.1, 0.2,
+  0.3, 0.6,
+  0.8, 1.1,
+  1.4, 1.8,
+  1.9, 2.3,
+  2.5, 2.65,
+  2.7, 2.9,
+  3.4, 5.1
+)
+
+dur <- dur %>% 
+  mutate(sampled=ifelse(floor(sto) - ceiling(sta) >= 0, "sampled", "ignored")) %>%
+  mutate(sampled=factor(sampled, levels=c("sampled", "ignored")))
+
+sample.times <- seq(floor(min(dur$sta)),ceiling(max(dur$sto))-1)
+
+height=0.1
+cols <- c(`sampled`="black", `ignored`="gray", `white`="white")
+ggplot(data=dur) +
+  #geom_segment(aes(x=sta,xend=sto,y=0,yend=0,color=sampled), size=4)
+  geom_vline(xintercept = sample.times, lty="dashed") +
+  geom_rect(aes(xmin=sta,xmax=sto,ymin=-height,ymax=height,color=sampled), fill="white", size=1) +
+  scale_colour_manual(values = cols, aesthetics = c("colour","fill")) +
+  ylim(-height, 1) +
+  xlab("time") + ylab(" ") + 
+  theme(axis.title.y     = element_blank(),
+        axis.text.y      = element_blank(),
+        axis.ticks.y     = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.title     = element_blank())
+```
+The process samples the duration of the events that are active ("in-flight") at sample time, and ignores all the others. 
+
+We will derive the probability distribution of the sampled durations given the original durations distribution in general, but focusing on the versatile Gamma distribution. We will build random generators to simulate the sampling process, and then design a Bayesian estimator to infer back the original distribution parameters, implemented in Stan. 
+
+# Introduction 
+
+Consider performing a marketing survey to study the behaviour of customers of a huge physical library (or maybe an on-line retailer). To reduce the study cost, a plausible policy might be to visit the library every hour and interview every one inside, ignoring other customers that enter the library later on the same hour.
+
+Imagine that one of the dimensions logged is "time spent inside the library". Since we will sample every one that spends more than one hour inside, but only half of people spending half an hour, one sixth of customers spending ten minutes, and so on, the sampled data will not be an accurate representation of the actual distribution of the inside-library duration. We would, for example, sadly overestimate the book-lovers proportion.
+
+But if we know the theoretical distribution of the original data, we can in principle estimate its parameters from the samples, and obtain a cleanest picture. 
+
+A real-life example of such a sampling process can be found in IT. Specialists in software performance optimization make extensive use of *statistical profilers*[^stat_prof]: tools that sample running programs execution at regular intervals and register what they were doing (e.g. waiting for disk, running on the CPU) for later analysis. These tools usually register only the occurrence on an event, not its duration; a notable exception is Oracle&copy;&reg; ASH[^ash_started], that samples the duration as well. Check [@ASHMATH], especially slide 33, for an extensive discussion.  
+
+[^stat_prof]: https://en.wikipedia.org/wiki/Profiling_(computer_programming)#Statistical_profilers 
+
+[^ash_started]: this is actually the tool that sparked my interest for this statistical problem. I've been using it for years, when dressing the hat of Oracle Performance Tuning specialist, one of my preferred outfits.
+
+This paper is my personal journey into this fascinating inference problem, limited to simulated data for simplicity and lack of time, that might be a good starting point for someone interested in inferring from real data.
+
+It's a Bayesian journey out of personal preference, but a Frequentist might easily adapt most of the paper for her toolbox; for example, an extension to MLE should be very simple, as hinted in the discussion.
+
+Last but not least: everything is demonstrated using a reproducible R Markdown document, and I have strived to write the cleanest code possible and to carefully document it.
+
+# Probability Distribution of the samples
+
+Letting $x \sim f(x)$ the event duration random variable and $y \sim g(y)$ the sampled one, we can easily derive the latter from the former by observing that the probability that $x$ is sampled is proportional to $x/T$ for $x<T$ (e.g. if $x$ is half as long as $T$, its sampling probability is 0.5) and is 1 for $x>=T$. Hence we just need to multiply $f(x)$ by the hinge function
+$$ h(x) \triangleq
+    \begin{cases}
+      x/T & x < T \\
+      1 & x >= T
+    \end{cases}
+$$
+and then renormalize, obtaining
+$$
+g(y) = p(y=x) =  \frac{h(x)f(x)}{\eta}\ ;\ \ \ \ \ \  \eta \triangleq \int_{0}^{\infty} h(\tau)f(\tau) d\tau
+$$
+We can further decompose $\eta$ as $\eta = \eta_A + \eta_B$, where 
+$$
+ \eta_A \triangleq \int_{0}^{T} h(\tau)f(\tau) d\tau = \frac{1}{T} \int_{0}^{T} \tau f(\tau) d\tau
+ $$ 
+ 
+$$\eta_B \triangleq \int_{T}^{\infty} h(\tau)f(\tau) d\tau = \int_{T}^{\infty} f(\tau) d\tau = 1 - \int_{0}^{T} f(\tau) d\tau = 1 - F(T)
+$$
+Note that $\eta_A$ is essentially the average value of $x$ over the interval $[0,T)$, and $\eta_B$ is based on the CDF of the distribution; if $f(x)$ is a well-known distribution, both are usually readily available, at least numerically approximated. 
+
+## Focus on the Gamma Distribution
+
+Let's now focus on the case of the Gamma distribution, very important in the context of durations[^gamma_incl_exp]. 
+
+[^gamma_incl_exp]: mostly because of its versatility: it includes the important exponential as a special case, and can approximate the normal itself well for high values of *shape* 
+
+
+$$
+  f(x) = Gamma(x | \alpha,\beta) = \frac{\beta^\alpha}{\Gamma(\alpha)} x^{\alpha-1}e^{-\beta x} 
+$$
+where $\alpha$ is usually named the "shape" and $\beta$ the "rate".
+
+For $x<T$ we have of course
+$$
+  g(y) = p(y=x) = \frac{x}{T} * Gamma(x | \alpha,\beta) \frac{1}{\eta}
+$$
+But, algebraically:
+$$
+  x * Gamma(x | \alpha,\beta) = 
+  \frac{\beta^\alpha}{\Gamma(\alpha)} x^{(\alpha+1)-1}e^{-\beta x} = 
+  \beta^{-1} \frac{\Gamma(\alpha+1)}{\Gamma(\alpha)}Gamma(x|\alpha+1,\beta) \ \ \ (1)
+$$
+that is
+$$
+ x \sim Gamma(\alpha, \beta)   \implies y \sim (const) * Gamma(\alpha+1, \beta); \ \ \ for \ x < T 
+$$
+
+hence the *effect of sampling is simply to increase the shape by 1*, normalization constants apart. Amazing[^shape_amazing] !
+
+[^shape_amazing]: if developed further, this result could probably give some insights about the physical meaning of "shape". 
+
+A practical benefit of (1) is that we can easily write $\eta$, the most difficult part of the density expression, as a function of Gamma (FGamma being the CDF):
+$$
+  \eta_A = \frac{1}{T} \beta^{-1} \frac{\Gamma(\alpha+1)}{\Gamma(\alpha)}FGamma(T|\alpha+1,\beta);\ \ \  \eta_B = 1 - FGamma(T|\alpha,\beta)
+$$
+In R, that becomes:
+```{r dsgamma}
+#' Density of the Sampled Gamma Distribution
+#'
+#' @param x     Vector of random variable values
+#' @param shape The original Gamma "shape" parameter
+#' @param rate  The original Gamma "rate" parameter
+#' @param T     The sampling period
+#' @param log   If TRUE, returns the log density
+#'
+#' @return Vector of (log) densities
+dsgamma <- function(x, shape, rate, T, log=FALSE) {
+  T.log <- base::log(T)
+  
+  # calc eta
+  A.log <- (-T.log) + 
+           (-base::log(rate)) + 
+           lgamma(shape+1) - lgamma(shape) + pgamma(T, shape=shape+1, rate=rate, log.p=TRUE) 
+  A <- exp(A.log)
+  B <- 1.0 - pgamma(T, shape=shape, rate=rate) 
+  eta.log <- log(A + B)
+  
+  # calc density
+  x  <- ifelse(x > .Machine$double.eps, x, NA)
+  f.log <- dgamma(x, shape=shape, rate=rate, log=TRUE)
+  h.log <- ifelse(x < T, base::log(x) - T.log, 0.0)
+  g.log <- ifelse(is.na(x), -Inf, f.log + h.log - eta.log)
+  if (log) {
+    return (g.log)
+  }
+  exp(g.log)
+}
+```
+## discussion
+
+```{r dsgamma_plot, include=FALSE}
+#' Plot density of the Sampled Gamma Distribution
+#'
+#' @param shape The original Gamma "shape" parameter
+#' @param rate  The original Gamma "rate" parameter
+#' @param T     The sampling period
+#' @param x.min Duration grid lower extreme
+#' @param x.max Duration grid upper extreme
+#' @param log   If TRUE, plot the log density
+#' @param plot.original If TRUE, plot the original density as well
+#' @param plot.T        If TRUE, plot a vertical dashed line to mark T 
+#'
+#' @return The ggplot object
+dsgamma.plot <- function(shape, rate, T, x.min, x.max, log=FALSE, plot.original=TRUE, plot.T=TRUE) {
+  # sample over grid
+  x.grid = seq(x.min, x.max, length.out=1000)
+  g <- dsgamma(x.grid, shape=shape, rate=rate, T=T, log=log)
+  data <- tibble(x=x.grid, d=g, name="sampled g(y)") 
+  if (plot.original) {
+    f <- dgamma(x.grid, shape=shape, rate=rate, log=log)
+    data <- bind_rows(data, tibble(x=x.grid, d=f, name="original f(x)"))
+  } 
+
+  # plot
+  tag_density_log <- ifelse(log, "log(density)", "density") 
+  title <- paste0("Sampled Gamma(shape=", shape, ", rate=", rate, ") T=", T)
+  colors <- c("sampled g(y)" = "black", "original f(x)" = "green")
+  ggplot(data=data) +
+    (if (plot.T) geom_vline(xintercept = T, lty="dashed") else geom_blank())+
+    geom_line(aes(x=x,y=d,color=name)) +
+    ggtitle(title) +
+    xlab("x,y") + 
+    ylab(tag_density_log) +
+    scale_colour_manual(values = colors) +
+    theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5))
+}
+```
+
+Let's plot the densities for a few interesting cases:
+
+```{r dsgamma_discussion, echo=FALSE}
+p1 <- dsgamma.plot(1,10,1,0,2)
+p2 <- dsgamma.plot(2,10,1,0,2)
+p3 <- dsgamma.plot(10,30,1,0,2)
+p4 <- dsgamma.plot(150,100,1,0,2)
+
+grid.arrange(p1, p2, p3, p4, ncol = 1)
+```
+The first plot is the case of the ubiquitous exponential distribution. The sampling distortion is quite dramatic: the exponential silhouette is gone; small durations, that used to concentrate most of the mass, have almost disappeared, and the mode itself has shifted from zero to about 0.1. 
+
+In the second case, the distortion is still quite noticeable; only in the third case, when the shape has got to 10, the distortion is relatively minimal.
+
+The fourth plot shows the case of a distribution whose mass is well above the sampling period. As expected, the sampled distribution is virtually the same as the original.
+
+<!-- distortion study as function of shape/rate and/or mu/sigma, especially for ASH? -->
+<!-- # ```{r dsgamma_discussion_ash, echo=FALSE} -->
+<!-- # sr <- gammaShRaFromMeanSD(5e-3, 3e-3) -->
+<!-- # dsgamma.plot(sr$shape,sr$rate,1,0,10e-3,plot.T=FALSE) -->
+<!-- # ``` -->
+
+# Random Generators and Simulation
+
+We now discuss two numerical methods for drawing random numbers from the sampled distribution $g(x)$ given a drawing function for $f(x)$, a crucial task for any serious application.
+
+## by physical process simulation 
+
+The most straightforward way is to directly implement the physical sampling process:
+
+```{r rsampled_physical}
+#' Draw samples y distributed as g(y) from the original distribution f(x), 
+#'   by simulating the physical process
+#'
+#' @param n      The number of draws desired from g(y) (i.e. length of y)
+#' @param f      A function that draws n numbers from the original durations distribution
+#' @param T      The sampling period
+#' @param b      A function that draws n numbers from the distribution of in-between time
+#' @param fill.x Whether to return the original x draws
+#'
+#' @return a list of two vectors: "x" with all the draws, and "y" for the sampled subset
+rsampled.phy <- function(n, f, T, b=NULL, fill.x=FALSE) {
+  y <- rep(-1, n)
+  x <- numeric(0)
+  xi <- 0; yi <- 0
+  sta <- 0; sto <- NA
+  
+  repeat {
+    # draw x from f(x)
+    dur <- f(1)
+    if (dur < 0) stop(paste0("negative duration from f: ", dur))
+    sto <- sta + dur
+    
+    # store x if so desired
+    if (fill.x) {
+      xi <- xi + 1
+      if (xi > length(x)) {
+        x <- append(x, rep(NA, 10*n))
+      }  
+      x[xi] <- dur
+    }
+     
+    # sample x as y if across sampling instant 
+    if (floor(sta/T) < floor(sto/T)) {
+      yi <- yi + 1
+      y[yi] <- dur
+      if (yi == n) break
+    }
+    
+    # draw from the in-between distribution
+    if (!is.null(b)) {
+      dur_break <- b(1)
+      if (dur_break < 0) stop(paste0("negative duration from b: ", dur_break))
+      sto <- sto + dur_break
+    }
+    
+    sta <- sto
+  }
+  list(x=x[1:xi], y=y)
+}
+```
+This trivial function simply draws a duration from the provided $f(x)$, sets accordingly the start and stop extremata of the event, and if the interval crosses the sampling instant it returns the duration as $y$. It can optionally store all the original draws from $x$ (which the $y$ vector is a subset of).
+
+Side note: to accurately simulate the physical process, an optional $b(x)$ distribution can be provided to model the time in-between events. This distribution does not alter[^stopping] the density of the returned $y$ random variate, but it could change the average size of $x$ (for example, if $f(x) \equiv b(x)$, the expected size of $x$ would be twice as long). $b(x)$ will never be used in this paper, but can be useful for other purposes.
+
+[^stopping]: this is because the *stopping intention* of this function is to stop when $n$ samples have been provided. If the stopping intention were, say, to stop after a certain time has elapsed, the number of samples would be a random variable, not a given number, influenced by $b(x)$ as well as $f(x)$. This is actually the most common real-life scenario but it is considerably more complex to handle and hence out-of-scope for this paper, that focuses on the fundamental theory; for the intricacies of this sampling intention see [@DBDA2E, page 308, "With intention to fix duration"], in the context of p-values. Anecdotally, the stopping intention should not change the results that much for practical applications.
+
+A call example is the specialization for the Gamma distribution that we will use from now on: 
+```{r rsgamma_phy}
+rsgamma.phy <- function(n, shape, rate, T, b=NULL, fill.x=FALSE) {
+  f <- function(n) {
+    rgamma(n, shape=shape, rate=rate)
+  }
+  rsampled.phy(n, f, T, b, fill.x)
+}
+
+set.seed(5)
+rsgamma.phy(2, shape=1, rate=1, T=1.0, fill.x=TRUE)
+```
+## by rejection sampling
+
+Another possibility is to draw a duration, and then accept it as a sample with probability $h(x)$:
+
+```{r rsampled_rejection}
+#' Draw samples y distributed as g(y) from the original distribution f(x), 
+#'   by acceptance/rejection sampling accordingly to h(x)
+#'
+#' @param n      The number of draws desired from g(y) (i.e. length of y)
+#' @param f      A function that draws n numbers from the original durations distribution
+#' @param T      The sampling period
+#'
+#' @return a vector containing the sampled y
+rsampled.rej <- function(n, f, T) {
+  y <- rep(-1, n)
+  yi <- 0
+  repeat {
+    dur <- f(1)
+    if (dur < 0) stop(paste0("negative duration from f: ", dur))
+    h = ifelse(dur < T, dur/T, 1)
+    p <- runif(1)
+    if (h > p) {
+      # accept
+      yi <- yi + 1
+      y[yi] <- dur
+      if (yi == n) break
+    } else {
+      #reject
+    }
+  }
+  y
+}
+```
+
+This is a great example of the classic technique of [acceptance-rejection sampling](https://en.wikipedia.org/wiki/Rejection_sampling). Actually, it is a marvelous example of an acceptance-rejection sampling that *happens physically*, not as a numeric artifact to efficiently draw random numbers from distributions.
+
+The drawback of rsampled.rej (and rsampled.phy actually) is that it is slow for distributions whose mass is concentrated near very small values; for example, for durations around 1e-3 it takes 1000 draws for each $y$ on average. Speed is anyway adequate for our purposes[^rej_faster].
+
+[^rej_faster]: I was experimenting with faster alternatives when time ran out; I might pursue that road again in the future.
+
+Call example, and specialization for the Gamma distribution: 
+```{r rsgamma_rej}
+rsgamma.rej <- function(n, shape, rate, T) {
+  f <- function(n) {
+    rgamma(n, shape=shape, rate=rate)
+  }
+  rsampled.rej(n, f, T)
+}
+
+set.seed(5)
+rsgamma.rej(2, shape=1, rate=1, T=1.0)
+```
+
+## Consistency checks
+
+Let's now check[^cc_code_markdown] that both our random generators are consistent with the theory we developed, to cross-check all of them.
+
+[^cc_code_markdown]: the checking code is not shown but of course available in the original Rmarkdown from Github (see link at the bottom).
+
+First, consider a generic Gamma:
+
+```{r consistency_checks, include=FALSE}
+consistency.plot <- function(shape, rate, T, x.min, x.max, 
+                             log=FALSE, plot.original=TRUE, plot.T=TRUE, n.samples=10000,
+                             dens.bandwidth = "SJ") {
+  if (plot.T) plot.T = x.min <= T && T <= x.max
+  
+  # calculate densities over grid
+  x.grid = seq(x.min, x.max, length.out=1000)
+  g <- dsgamma(x.grid, shape=shape, rate=rate, T=T, log=log)
+  data <- tibble(x=x.grid, y=g, name="sampled g(y)") 
+  if (plot.original) {
+    f <- dgamma(x.grid, shape=shape, rate=rate, log=log)
+    data <- bind_rows(data, tibble(x=x.grid, y=f, name="original f(x)"))
+  } 
+  
+  # draw from distributions and calculate empirical density
+  add_dens <- function(s, name) {
+    dens <- density(s, bw=dens.bandwidth)
+    tbl <- tibble(x=dens$x, y=dens$y, name=name)
+    data <<- bind_rows(data, tbl)
+  }
+  phy <- rsgamma.phy(n.samples, shape, rate, T, fill.x=plot.original)
+  add_dens(phy$y, "density(y) [phy]")
+  y.rej <- rsgamma.rej(n.samples, shape, rate, T)
+  add_dens(y.rej, "density(y) [rej]")
+  if (plot.original) {
+     add_dens(phy$x, "density(x) [phy]")
+  }
+
+  # plot
+  tag_density_log <- ifelse(log, "log(density)", "density") 
+  title <- paste0("Sampled Gamma(shape=", shape, ", rate=", rate, ") T=", T)
+  colors <- c("sampled g(y)" = "black", "original f(x)" = "green", 
+              "density(y) [phy]" = "orange", "density(y) [rej]" = "yellow",
+              "density(x) [phy]" = "blue")
+  ggplot(data=data) +
+    (if (plot.T) geom_vline(xintercept = T, lty="dashed") else geom_blank())+
+    geom_line(aes(x=x,y=y,color=name)) +
+    ggtitle(title) +
+    xlim(x.min, x.max) +
+    xlab("x,y") + 
+    ylab(tag_density_log) +
+    scale_colour_manual(values = colors) +
+    theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5))
+}
+```
+
+```{r cons_check_nice_colorful, echo=FALSE, fig.asp=0.3}
+# bella figura colorata
+set.seed(68)
+consistency.plot(shape = 2, rate = 14, T = 0.25, x.min=0, x.max=0.75, n.samples=100000)
+```
+The two generators empirical densities for $y$ lay perfectly over the sampled theoretical density (shown in black), and the same goes for the original $x$ duration draws (the original theoretical density is shown in green).
+
+Next, consider the Exponential case:
+
+```{r cons_check_arount_t, echo=FALSE, fig.asp=0.3}
+#bella figura colorata
+set.seed(68)
+consistency.plot(shape = 1, rate = 1, T = 1, x.min=0.0, x.max=2, n.samples=100000)
+```
+
+Note the same perfect juxtaposition around T, the critical value around which the density changes[^t_critical_shape] its silhouette.
+
+[^t_critical_shape]: also note that the density is still continuous at T, but the first derivative is not
+
+# Reparameterization (and a look at the Likelihood)
+
+The following well-know formulae allows us to reparameterize the Gamma in term of the expected mean and standard deviation: 
+$$
+  x \sim Gamma(\alpha, \beta)   
+  \implies
+  \begin{cases}
+    \mu \triangleq E[x] = \alpha / \beta \\
+    \sigma \triangleq sd[x] = \sqrt{\alpha / \beta^2 }
+  \end{cases}
+  \implies
+  \begin{cases}
+    \alpha = \mu^2 / \sigma^2 \\
+    \beta = \mu   / \sigma^2
+  \end{cases}
+$$
+The main motivation for this change of parameters is for Bayesian analysis, since prior knowledge is usually expressed in term of $\mu$ and $\sigma$ rather than $\alpha$ and $\beta$; for example, we may probably easily know that the a-priori wait time for a storage disk is 5msec $\pm$ 1 msec from previous measurements or from the disk technical specification, but it is less likely (in general) that we know plausible intervals for $\alpha$ and $\beta$.
+
+```{r gamma_reparam, include=FALSE}
+# TBD roxygen
+dsgamma2 <- function(x, mu, sigma, T, log=FALSE) {
+  shape <- mu^2 / sigma^2
+  rate  <- mu   / sigma^2
+  dsgamma(x, shape=shape, rate=rate, T=T, log=log)
+}
+dsgamma2(0.5, 1, 1, 1)
+
+# TBD roxygen
+rsgamma2.phy <- function(n, mu, sigma, T, b=NULL, fill.x=FALSE) {
+  shape <- mu^2 / sigma^2
+  rate  <- mu   / sigma^2
+  rsgamma.phy(n, shape=shape, rate=rate, T=T, b=b, fill.x=fill.x)
+}
+rsgamma2.phy(2, 1, 1, 1, fill.x=TRUE)
+
+# TBD roxygen
+rsgamma2.rej <- function(n, mu, sigma, T) {
+  shape <- mu^2 / sigma^2
+  rate  <- mu   / sigma^2
+  rsgamma.rej(n, shape=shape, rate=rate, T=T)
+}
+rsgamma2.rej(2, 1, 1, 1)
+```
+
+Let's now take a look at the resulting likelihoods shapes, by taking some draws from a Sampled Gamma and then calculating the log-likelihood over a grid around the parameter values. Let's consider again the two densities we used in the "consistency check" section:
+
+```{r likelihood_explore_sr, include=FALSE}
+
+likelihood.explore.sr <- function(true.shape, true.rate, T) {
+  n.samples <- 1000
+  y <- rsgamma.rej(n.samples, shape=true.shape, rate=true.rate, T=T)
+
+  shape.grid <- seq(0.1, 2*true.shape, length.out=100)
+  rate.grid <-  seq(0.1, 2*true.rate , length.out=100)
+
+  grid <- tibble(shape=shape.grid) %>% 
+    cross_join(tibble(rate=rate.grid))
+
+  likelihood.log <- function(s, r) {
+    sum(dsgamma(y, shape=s, rate=r, T=T, log=TRUE))
+  }
+
+  likelihood.grid <- grid %>%
+    mutate(like.log = purrr::map2_dbl(shape, rate, likelihood.log))
+
+  max.i = which.max(likelihood.grid$like.log)
+  max.fig = likelihood.grid[max.i,][c("shape","rate")]
+
+  title <- paste0("(shape=", true.shape, ", rate=", true.rate, ") T=", T)
+  ggplot() +
+    #geom_abline(slope = true.shape / true.rate, intercept=0, lty="dashed") +
+    geom_contour(data=likelihood.grid, mapping=aes(x=rate, y=shape, z=like.log), bins=50) +
+    geom_point(aes(x=true.rate, y=true.shape), color="black", shape=3, size=4) +
+    geom_point(aes(x=max.fig$rate, y=max.fig$shape), color="blue", shape=19, size=4) + 
+    xlim(range(rate.grid)) + ylim(range(shape.grid)) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+```{r likelihood_explore_ms, include=FALSE}
+likelihood.explore.ms <- function(true.shape, true.rate, T) {
+  true.mu    <-      true.shape / true.rate
+  true.sigma <- sqrt(true.shape / true.rate^2)
+  
+  n.samples <- 1000
+  y <- rsgamma2.rej(n.samples, mu=true.mu, sigma=true.sigma, T=T)
+
+  mu.grid    <- seq(0.2*true.mu   , 2*true.mu   , length.out=100)
+  sigma.grid <- seq(0.2*true.sigma, 2*true.sigma, length.out=100)
+
+  grid <- tibble(mu=mu.grid) %>% 
+    cross_join(tibble(sigma=sigma.grid))
+  
+  likelihood.log <- function(m, s) {
+    sum(dsgamma2(y, mu=m, sigma=s, T=T, log=TRUE))
+  }
+
+  likelihood.grid <- grid %>%
+    mutate(like.log = purrr::map2_dbl(mu, sigma, likelihood.log))
+  
+  max.i = which.max(likelihood.grid$like.log)
+  max.fig = likelihood.grid[max.i,][c("mu","sigma")]
+
+  title <- paste0("(shape=", true.shape, ", rate=", true.rate, ") T=", T)
+  ggplot() +
+    geom_contour(data=likelihood.grid, mapping=aes(x=sigma, y=mu, z=like.log), bins=1000) +
+    geom_point(aes(x=true.sigma, y=true.mu), color="black", shape=3, size=4) +
+    geom_point(aes(x=max.fig$sigma, y=max.fig$mu), color="blue", shape=19, size=4) + 
+    xlim(range(sigma.grid)) + ylim(range(mu.grid)) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+```{r likelihood.explore, echo=FALSE} 
+set.seed(73)
+p1 <- likelihood.explore.sr(true.shape = 2, true.rate = 14, T = 0.25)
+p2 <- likelihood.explore.sr(true.shape = 1, true.rate = 1, T = 1)
+p3 <- likelihood.explore.ms(true.shape = 2, true.rate = 14, T = 0.25)
+p4 <- likelihood.explore.ms(true.shape = 1, true.rate = 1, T = 1)
+
+grid.arrange(p1, p2, p3, p4, ncol = 2, top="log-likelihood of Sampled Gamma")
+```
+
+We can see that the maximum value (the big blue dot) is very close to the true value (the black cross). Also, the curve looks continuous (probably concave in general), and that bodes well for using an algorithm like gradient-descent to build an MLE estimator.
+
+# Bayesian Inference by Stan
+
+The sampling process, as we have seen, might sample only a small portion of the original durations (e.g. one out of 1,000 for durations around 1msec if $T$=1sec), and that might leave us with very few data to build our inference on. Mathematical models are preferable in general with small datasets, and Bayesian models in particular, since they can incorporate prior (or "domain") knowledge to further improve the inference.
+
+We will explore the simple case of uninformative priors, both for simplicity and because the results should be nearly the same we might obtain using MLE or similar Frequentist techniques. Adding other priors in the Stan model is definitely trivial anyway.
+
+We will parameterize the model by $\mu$ and $\sigma$ mostly because, as already discussed, prior knowledge is probably more readily expressed on these parameters rather then on $shape$ and $rate$. 
+
+Side note: another reason is that the chains seem to converge quicker using $\mu$ and $\sigma$, but I have not made an exhaustive comparison, so take my word with a grain of salt; yet, the likelihood plots previously shown seem to indicate a smaller correlation between $\mu$ and $\sigma$ than between $shape$ and $rate$.
+
+I have of course checked the chains convergence using the usual techniques (visual inspection of the chains, Gelman-Rubin statistics, etc). I will not plot them for the sake of brevity; interested readers can inspect them by activating the plots in the original Rmarkdown source[^activate_conv_plot].
+
+[^activate_conv_plot]: just knit with stan.inference.print.conv set to TRUE 
+
+Here's the Stan model: 
+
+```{r stan_model_codel}
+stan_model_code <- "
+functions {
+  real sampled_gamma_lpdf(data real[] x, real shape, real rate, data real T) {
+    real T_log = log(T) ;
+
+    // calc eta
+    real A_log = (-T_log) + 
+                 (-log(rate)) + 
+                 lgamma(shape+1.0) - lgamma(shape) + gamma_lcdf ( T | (shape+1.0), rate ); 
+    real A = exp(A_log) ; 
+    real B = 1.0 - gamma_cdf ( T, shape, rate );
+    real eta_log = log(A + B);
+    
+    // calc density
+    real acc = 0.0;
+    for (i in 1:num_elements(x)) {
+      real xx = x[i];
+      real f_log = gamma_lpdf(xx | shape, rate);
+      real h_log = xx < T ? log(xx) - T_log : 0.0;
+      real d_log = f_log + h_log - eta_log;
+      acc += d_log;
+    }
+    return acc;
+  }
+
+  real sampled_gamma_mu_sigma_lpdf(data real[] x, real mu, real sigma, data real T) {
+    real shape = mu^2 / sigma^2;
+    real rate  = mu   / sigma^2;
+    return sampled_gamma_lpdf(x | shape, rate, T);
+  }
+}
+data {
+  int<lower=0> N;
+  real y[N]; 
+  real T;
+}
+parameters {
+  real<lower=0> mu;
+  real<lower=0> sigma;
+}
+model {
+  mu    ~ uniform(0.0000001, 100000); // uninformative prior
+  sigma ~ uniform(0.0000001, 100000); // uninformative prior
+  y ~ sampled_gamma_mu_sigma_lpdf(mu, sigma, T);
+}
+generated quantities {
+  real shape = mu^2 / sigma^2;
+  real rate  = mu   / sigma^2;
+}
+
+"
+```
+
+```{r stan_inference_compile_model, include=FALSE}
+# stan_model_dso cannot be in a function, even if auto_write == TRUE,
+# since the model on disk cannot be read twice otherwise 
+# it would crash the R session (!)
+# check https://github.com/stan-dev/rstan/issues/265
+rstan_options(auto_write = TRUE)
+stan_model_dso <- stan_model( model_code = stan_model_code )
+```
+
+Note that the core of the model is a simple translation (almost a copy-and-paste) of dsgamma from R to the Stan language[^dsgamma_repar]. Also note the uninformative priors, and that in the posterior MCMC samples we derive $shape$ and $rate$ as well for convenience.
+
+[^dsgamma_repar]: it is also re-parameterized using a simple wrapper function, and by skipping the wrapper one can get back the parameterization in term of $shape$ and $rate$.
+
+```{r stan_inference_globals, include=FALSE}
+stan.inference.n.samples <- 100
+stan.inference.n.samples2 <- 1000
+stan.inference.print.conv <- FALSE
+```
+
+Let's now investigate the inference, by generating `r stan.inference.n.samples` duration samples, feeding them to Stan to get back the posterior MCMC chains, and by plotting both PMDE (Posterior Mean Density Estimate), the density curve whose parameters are the mean of the posterior chains, and the PSDS (Posterior Samples Density Set), a smattering of densities whose parameters are chosen at random from the posterior chains.
+
+```{r stan_inference_mcmc, include=FALSE}
+stan.inference.mcmc <- function(y, T){ 
+  dataList <- list(y= y, N=length(y), T=T)
+  stanFit <- sampling(object=stan_model_dso, data=dataList,
+                      chains=7, iter=20000, warmup=10000, thin=1)
+  
+  chains.coda <- mcmc.list(lapply(1:ncol(stanFit),
+                                  function(x) {mcmc(as.array(stanFit)[,x,])}))
+
+  chains.tibble <- as_tibble(rstan::extract(stanFit))
+  list(tibble=chains.tibble, coda=chains.coda)
+}
+```
+
+```{r stan_inference_make_plot, include=FALSE} 
+stan.inference.make.plot <- function(true.shape, true.rate, T, y, posterior,
+                                     x.min, x.max, 
+                                     log=FALSE, plot.original=TRUE, plot.T=TRUE) {
+  if (plot.T) plot.T = x.min <= T && T <= x.max
+  
+  # calculate x grid
+  x.grid = seq(x.min, x.max, length.out=1000)
+  
+  # calculate densities over grid
+  data <- tibble()
+  add_dens <- function(sh, ra, name.sampled, name.original, line_idx=0) {
+    d <- dsgamma(x.grid, shape=sh, rate=ra, T=T, log=log)
+    t <- tibble(x=x.grid, y=d, name=name.sampled, orig.sampled="sampled", line_idx=line_idx)
+    data <<- bind_rows(data, t)
+    if (plot.original) {
+      d <- dgamma(x.grid, shape=sh, rate=ra, log=log)
+      t <- tibble(x=x.grid, y=d, name=name.original, orig.sampled="original", line_idx=line_idx+0.5)
+      data <<- bind_rows(data, t)
+    } 
+  }
+  
+  # true densities 
+  add_dens(true.shape, true.rate, "sampled g(y)", "original f(x)", 1e9)
+  
+  # posterior mean density
+  post_mean <- map_dbl(posterior$tibble, mean)
+  pm.shape = post_mean["shape"]; pm.rate = post_mean["rate"]
+  add_dens(pm.shape, pm.rate, "PMDE", "PMDE", 1e9+1)
+  
+  # smattering 
+  ps <- dplyr::sample_n(posterior$tibble, 40)
+  for (idx in 1:nrow(ps)) {
+    add_dens(ps[[idx, "shape"]], ps[[idx, "rate"]], "PSDS", "PSDS", line_idx=idx)
+  }
+  
+  # plot
+  y.max <- 1.1 * max(data %>% filter(name %in% c("sampled g(y)", "original f(x)")) %>% select(y))
+  tag_density_log <- ifelse(log, "log(density)", "density") 
+  title <- paste0("Sampled Gamma(shape=", true.shape, ", rate=", true.rate, ") T=", T)
+  annotation <- paste0("posterior mean: shape=", round(pm.shape,3), ", rate=", round(pm.rate,3), " length(y)=", length(y))
+  colors <- c("sampled g(y)" = "black", "original f(x)" = "green", 
+              "PMDE" = "red", "PSDS" = "gray")
+  ggplot(data=data) +
+    (if (plot.T) geom_vline(xintercept = T, lty="dashed") else geom_blank()) +
+    # note: geom_line() plot lines in "group" order
+    geom_line(aes(x=x,y=y,color=name,group=line_idx)) +
+    facet_grid(orig.sampled ~ ., scales="free_y") +
+    ggtitle(title) +
+    xlim(x.min, x.max) +
+    ylim(0, y.max) +
+    xlab("x,y") + 
+    ylab(tag_density_log) +
+    scale_colour_manual(values = colors) +
+    theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5)) +
+    annotate("label", label=annotation, x=x.max, y=y.max, size = 4, colour = "red", vjust = "inward", hjust = "inward")
+}
+```
+
+```{r stan_inference_convergence_plot, include=FALSE} 
+stan.inference.convergence.plot <- function(posterior) {
+  mcmcCoda <- posterior$coda[,c("shape","rate","mu","sigma")]
+  plot(mcmcCoda)
+  gelman.diag(mcmcCoda)
+  gelman.plot(mcmcCoda)
+  effectiveSize(mcmcCoda)
+  #autocorr.diag(mcmcCoda)
+}
+```
+
+```{r stan_inference_plot, include=FALSE}
+stan.inference.plot <- function(true.shape, true.rate, T, n.samples, x.min, x.max) {
+  true.mu    <-      true.shape / true.rate
+  true.sigma <- sqrt(true.shape / true.rate^2)
+  
+  # draw duration samples 
+  y <- rsgamma2.rej(n.samples, mu=true.mu, sigma=true.sigma, T=T)
+  
+  # draw mcmc chains
+  posterior <- stan.inference.mcmc(y, T)
+  
+  # make density plot 
+  density.plot <- stan.inference.make.plot (true.shape, true.rate, T, y, posterior, 
+                                            x.min, x.max,
+                                            log=FALSE, plot.original=TRUE, plot.T=TRUE)
+  
+  list(y=y, posterior=posterior, density.plot=density.plot)
+}
+```
+
+Here are the final inferences for our usual pair of densities. First, consider the generic Gamma: 
+
+```{r stan_inference_plot1, echo=FALSE, results='hide', fig.asp=0.3}
+set.seed(6873)
+ret <- stan.inference.plot(true.shape = 2, true.rate = 14, T = 0.25, n.samples=stan.inference.n.samples, x.min=0, x.max=0.75)
+print(ret$density.plot)
+```
+```{r stan_inference_plot1_conv, echo=FALSE, results='hide', fig.asp=1.2}
+if (stan.inference.print.conv) stan.inference.convergence.plot(ret$posterior)
+```
+
+We can see that the PMDE closely fits the true density curve, and that the PSDS are packed around it, albeit not very tightly, as expected given the low number of samples.
+
+Next, consider the exponential:
+
+```{r stan_inference_plot2, echo=FALSE, results='hide', fig.asp=0.3}
+set.seed(6873)
+ret <- stan.inference.plot(true.shape = 1, true.rate = 1, T = 1, n.samples=stan.inference.n.samples, x.min=0, x.max=2)
+print(ret$density.plot)
+```
+
+```{r stan_inference_plot2_conv, echo=FALSE, results='hide', fig.asp=1.2}
+if (stan.inference.print.conv) stan.inference.convergence.plot(ret$posterior)
+```
+
+Both the PMDE and the PSDS seem to be qualitatively near to the true density for $x$ >> 0, and far from it for $x$ near zero. But, this is actually an intrinsic issue for the exponential distribution when considered as a particular case of the Gamma: you can never get accurate estimates for $x$ near to zero. This is because
+$$
+   	\lim_{x \to 0} Gamma(x | \alpha,\beta) = \begin{cases}
+      +\infty & \alpha < 1 \\
+      \beta & \alpha = 1 \\
+      0 & \alpha > 1
+    \end{cases}
+$$
+
+Hence any error of the $shape$ estimate will make you drift away from $beta$, towards zero or $+\infty$ depending on the error sign, whatever small the error modulus is, as patently obvious from the PSDS plot above. 
+
+In other words: the behaviour for $x$ near zero is structural[^exp_zero_alternative], nothing is wrong with the Bayesian estimate.
+
+[^exp_zero_alternative]: if there are strong (theoretical?) reasons to believe that the true density is actually exponential, the best approach is probably to use an exponential model instead of a Gamma one. One could simply plug the exponential as $f(x)$ in the first formulae we derived, or could possibly use our Stan model by forcing $shape$ = 1. 
+
+Of course the estimates neatly improve if more data is available. Here are the results with a dataset of `r stan.inference.n.samples2` duration samples:
+
+```{r stan_inference_plot1_bis, echo=FALSE, results='hide', fig.asp=0.3}
+set.seed(6873)
+ret <- stan.inference.plot(true.shape = 2, true.rate = 14, T = 0.25, n.samples=stan.inference.n.samples2, x.min=0, x.max=0.75)
+print(ret$density.plot)
+```
+```{r stan_inference_plot1_bis_conv, echo=FALSE, results='hide', fig.asp=1.2}
+if (stan.inference.print.conv) stan.inference.convergence.plot(ret$posterior)
+```
+
+```{r stan_inference_plot2_bis, echo=FALSE, results='hide', fig.asp=0.3}
+set.seed(6873)
+ret <- stan.inference.plot(true.shape = 1, true.rate = 1, T = 1, n.samples=stan.inference.n.samples2, x.min=0, x.max=2)
+print(ret$density.plot)
+```
+```{r stan_inference_plot2_bis_conv, echo=FALSE, results='hide', fig.asp=1.2}
+if (stan.inference.print.conv) stan.inference.convergence.plot(ret$posterior)
+```
+
+```{r ash_fetch, include=FALSE}
+# for the future self: just in case we want to start an ASH investigation
+
+extract_samples <- function () {
+  library(ROracle)
+  library(DBI)
+  
+  drv <- DBI::dbDriver("Oracle")
+  conn <- DBI::dbConnect(drv, user="EU24216", password="xxx", dbname="x8_eiip")
+  
+  samples <- DBI::dbGetQuery(conn, 
+    "select sample_time,  
+            instance_number,
+            decode( session_state, 'ON CPU', 'cpu/runqueue', event) as event,
+            time_waited
+       from sys.dba_hist_active_sess_history where sample_time > trunc(sysdate) - 30 ")
+  
+  samples <- as_tibble(samples)
+  names(samples) <- tolower(names(samples))
+  samples
+}
+
+if (FALSE) {
+  samples <- extract_samples()
+  saveRDS(samples, file = 'ash_samples.rds')
+}
+
+# samples <- readRDS('ash_samples.rds')
+
+```
+
+# Conclusion, and next steps
+
+We have explored a Bayesian way to infer the parameters of a duration distribution given some samples over an uniform interval, focusing on the versatile Gamma distribution. We have simulated the data and the sampling process using R and the Stan MCMC tool, exploring the fitness of the estimates to the true data using conventional Bayesian techniques.
+
+The next obvious step is to experiment with real data. The most challenging step is to choose a good distribution for the physical process that we want to study; for software program statistical profilers (including ASH) we should probably use a distribution arising from Queueing Theory, since "everything is a Queue" inside a computer, after all.
+
+Using Bayesian Statistics would also allows us to factor in expert knowledge, that would dictate which Prior to use (I have used only uninformative priors in the paper, for simplicity). For example, an expert might tell us that the average disk response time is between 0.5ms and 3msec, and that would certainly help both the precision of the estimates and the MCMC convergence. 
+
+And the "expert" might be an automated tool that mined historical data, producing a general, broad Prior to be used as input.
+
+<!-- 
+is_html_output: `r knitr::is_html_output()`
+is_latex_output: `r knitr::is_latex_output()`
+--> 
+
+Document version: `r lubridate::today() %>% format('%Y/%m/%d')` 
+
+&copy; 2020-2021 Alberto Dell'Era. Licensed as CC-BY-4.0 License. 
+
+# References
+
+Gihub repository: (https://github.com/alberto-dellera/sampling_event_duration), with the Rmarkdown source
+
+ 
