@@ -109,7 +109,7 @@ readings.error.sd <- 250  # m
 readings.n        <- 3 
 
 ```
-*A short summary is available at: <https://github.com/alberto-dellera/sampling_event_duration/blob/master/README.md>*
+*A short summary is available at: <https://github.com/alberto-dellera/sampling_event_duration/blob/main/README.md>*
 
 *Github readers: github on-line resolution is very low, and the pdf can be even truncated(!)  
 I'd suggest to download this pdf and open it locally*

@@ -1,5 +1,5 @@
 *This is a short summary only; the full study is available at:*   
-*https://github.com/alberto-dellera/sampling_event_duration/blob/master/root/full_study/sampling_event_duration.pdf*
+*https://github.com/alberto-dellera/sampling_event_duration/blob/main/root/full_study/sampling_event_duration.pdf*
 
 We will study an event sampling process whose sampling period is uniform:
 
@@ -15,5 +15,5 @@ We will build random generators to simulate the sampling process, and then desig
 
 ![](root/full_study/static_images/stan_inference_plot1-1.png)
 
-*https://github.com/alberto-dellera/sampling_event_duration/blob/master/root/full_study/sampling_event_duration.pdf*
+*https://github.com/alberto-dellera/sampling_event_duration/blob/main/root/full_study/sampling_event_duration.pdf*
 
